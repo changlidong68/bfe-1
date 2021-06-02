@@ -21,15 +21,19 @@
 package bfe_server
 
 import (
+	"crypto/tls"
 	"io"
 	"net"
 	"reflect"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 import (
 	"github.com/baidu/go-lib/log"
+	"golang.org/x/net/http2"
 )
 
 import (
@@ -38,6 +42,7 @@ import (
 	"github.com/bfenetworks/bfe/bfe_basic"
 	"github.com/bfenetworks/bfe/bfe_config/bfe_cluster_conf/cluster_conf"
 	"github.com/bfenetworks/bfe/bfe_debug"
+	"github.com/bfenetworks/bfe/bfe_fcgi"
 	"github.com/bfenetworks/bfe/bfe_http"
 	"github.com/bfenetworks/bfe/bfe_http2"
 	"github.com/bfenetworks/bfe/bfe_module"
@@ -46,6 +51,20 @@ import (
 	"github.com/bfenetworks/bfe/bfe_spdy"
 	"github.com/bfenetworks/bfe/bfe_util"
 )
+
+// TrailerPrefix is a magic prefix for ResponseWriter.Header map keys
+// that, if present, signals that the map entry is actually for
+// the response trailers, and not the response headers. The prefix
+// is stripped after the ServeHTTP call finishes and the values are
+// sent in the trailers.
+//
+// This mechanism is intended only for trailers that are not known
+// prior to the headers being written. If the set of trailers is fixed
+// or known before the header is written, the normal Go trailers mechanism
+// is preferred:
+//    https://golang.org/pkg/net/http/#ResponseWriter
+//    https://golang.org/pkg/net/http/#example_ResponseWriter_trailers
+const TrailerPrefix = "Trailer:"
 
 // RoundTripperMap holds mappings from cluster-name to RoundTripper.
 type RoundTripperMap map[string]bfe_http.RoundTripper
@@ -90,14 +109,27 @@ func hopByHopHeaderRemove(outreq, req *bfe_http.Request) {
 	// copied above) so we only copy it if necessary.
 	copiedHeaders := false
 	for _, h := range bfe_basic.HopHeaders {
-		if outreq.Header.Get(h) != "" {
-			if !copiedHeaders {
-				outreq.Header = make(bfe_http.Header, len(req.Header))
-				bfe_http.CopyHeader(outreq.Header, req.Header)
-				copiedHeaders = true
-			}
-			outreq.Header.Del(h)
+		hv := outreq.Header.Get(h)
+		if hv == "" {
+			continue
 		}
+
+		if h == "Te" && hv == "trailers" {
+			// Issue 21096: tell backend applications that
+			// care about trailer support that we support
+			// trailers. (We do, but we don't go out of
+			// our way to advertise that unless the
+			// incoming client request thought it was
+			// worth mentioning)
+			continue
+		}
+
+		if !copiedHeaders {
+			outreq.Header = make(bfe_http.Header, len(req.Header))
+			bfe_http.CopyHeader(outreq.Header, req.Header)
+			copiedHeaders = true
+		}
+		outreq.Header.Del(h)
 	}
 }
 
@@ -120,22 +152,27 @@ func (p *ReverseProxy) setTransports(clusterMap bfe_route.ClusterMap) {
 			continue
 		}
 
-		t := transport.(*bfe_http.Transport)
+		switch t := transport.(type) {
+		case *bfe_http.Transport:
+			// get transport, check if transport needs update
+			backendConf := conf.BackendConf()
+			if (t.MaxIdleConnsPerHost != *backendConf.MaxIdleConnsPerHost) ||
+				(t.MaxConnsPerHost != *backendConf.MaxConnsPerHost) ||
+				(t.ResponseHeaderTimeout != time.Millisecond*time.Duration(*backendConf.TimeoutResponseHeader)) ||
+				(t.ReqWriteBufferSize != conf.ReqWriteBufferSize()) ||
+				(t.ReqFlushInterval != conf.ReqFlushInterval()) {
+				// create new transport with newConf instead of update transport
+				// update transport needs lock
+				transport = createTransport(conf)
+				newTransports[cluster] = transport
+				continue
+			}
 
-		// get transport, check if transport needs update
-		backendConf := conf.BackendConf()
-		if (t.MaxIdleConnsPerHost != *backendConf.MaxIdleConnsPerHost) ||
-			(t.ResponseHeaderTimeout != time.Millisecond*time.Duration(*backendConf.TimeoutResponseHeader)) ||
-			(t.ReqWriteBufferSize != conf.ReqWriteBufferSize()) ||
-			(t.ReqFlushInterval != conf.ReqFlushInterval()) {
-			// create new transport with newConf instead of update transport
-			// update transport needs lock
+			newTransports[cluster] = transport
+		default:
 			transport = createTransport(conf)
 			newTransports[cluster] = transport
-			continue
 		}
-
-		newTransports[cluster] = transport
 	}
 
 	p.transports = newTransports
@@ -159,25 +196,49 @@ func (p *ReverseProxy) getTransport(cluster *bfe_cluster.BfeCluster) bfe_http.Ro
 
 func createTransport(cluster *bfe_cluster.BfeCluster) bfe_http.RoundTripper {
 	backendConf := cluster.BackendConf()
+	protocol := *backendConf.Protocol
 
 	log.Logger.Debug("create a new transport for %s, timeout %d", cluster.Name, *backendConf.TimeoutResponseHeader)
 
-	// cluster has its own Connect Server Timeout.
-	// so each cluster has a different transport
-	// once cluster's timeout updated, dailer use new value
-	dailer := func(network, add string) (net.Conn, error) {
-		timeout := time.Duration(cluster.TimeoutConnSrv()) * time.Millisecond
-		return net.DialTimeout(network, add, timeout)
-	}
+	switch protocol {
+	case "http":
+		// cluster has its own Connect Server Timeout.
+		// so each cluster has a different transport
+		// once cluster's timeout updated, dailer use new value
+		dailer := func(network, add string) (net.Conn, error) {
+			timeout := time.Duration(cluster.TimeoutConnSrv()) * time.Millisecond
+			return net.DialTimeout(network, add, timeout)
+		}
 
-	return &bfe_http.Transport{
-		Dial:                  dailer,
-		DisableKeepAlives:     (*backendConf.MaxIdleConnsPerHost) == 0,
-		MaxIdleConnsPerHost:   *backendConf.MaxIdleConnsPerHost,
-		ResponseHeaderTimeout: time.Millisecond * time.Duration(*backendConf.TimeoutResponseHeader),
-		ReqWriteBufferSize:    cluster.ReqWriteBufferSize(),
-		ReqFlushInterval:      cluster.ReqFlushInterval(),
-		DisableCompression:    true,
+		return &bfe_http.Transport{
+			Dial:                  dailer,
+			DisableKeepAlives:     (*backendConf.MaxIdleConnsPerHost) == 0,
+			MaxIdleConnsPerHost:   *backendConf.MaxIdleConnsPerHost,
+			ResponseHeaderTimeout: time.Millisecond * time.Duration(*backendConf.TimeoutResponseHeader),
+			ReqWriteBufferSize:    cluster.ReqWriteBufferSize(),
+			ReqFlushInterval:      cluster.ReqFlushInterval(),
+			DisableCompression:    true,
+			MaxConnsPerHost:       *backendConf.MaxConnsPerHost,
+		}
+	case "fcgi":
+		return &bfe_fcgi.Transport{
+			Root:    backendConf.FCGIConf.Root,
+			EnvVars: backendConf.FCGIConf.EnvVars,
+		}
+	case "h2c":
+		return &bfe_http2.Transport{
+			T: &http2.Transport{
+				AllowHTTP: true,
+				DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+					timeout := time.Duration(cluster.TimeoutConnSrv()) * time.Millisecond
+					return net.DialTimeout(network, addr, timeout)
+				},
+			},
+		}
+	default:
+		/* never come here */
+		log.Logger.Warn("unknown cluster protocol %s", protocol)
+		return nil
 	}
 }
 
@@ -277,8 +338,11 @@ func (p *ReverseProxy) clusterInvoke(srv *BfeServer, cluster *bfe_cluster.BfeClu
 		request.Backend.BackendPort = uint32(backend.Port)
 
 		if err == nil {
-			// succeed in invoking backend
-			backend.OnSuccess()
+			if checkBackendStatus(cluster.OutlierDetectionHttpCode(), res.StatusCode) {
+				backend.OnFail(cluster.Name)
+			} else {
+				backend.OnSuccess()
+			}
 
 			// clear err msg in req.
 			// this step is required, if finally succeed after retry
@@ -308,7 +372,7 @@ func (p *ReverseProxy) clusterInvoke(srv *BfeServer, cluster *bfe_cluster.BfeClu
 		//  5. other error
 		allowRetry := false
 		switch err.(type) {
-		case bfe_http.ConnectError:
+		case bfe_http.ConnectError, bfe_fcgi.ConnectError:
 			// if error happens in dial phrase, we can retry
 			request.ErrCode = bfe_basic.ErrBkConnectBackend
 			request.ErrMsg = err.Error()
@@ -316,7 +380,7 @@ func (p *ReverseProxy) clusterInvoke(srv *BfeServer, cluster *bfe_cluster.BfeClu
 			allowRetry = true
 			backend.OnFail(cluster.Name)
 
-		case bfe_http.WriteRequestError:
+		case bfe_http.WriteRequestError, bfe_fcgi.WriteRequestError:
 			request.ErrCode = bfe_basic.ErrBkWriteRequest
 			request.ErrMsg = err.Error()
 			p.proxyState.ErrBkWriteRequest.Inc(1)
@@ -328,7 +392,7 @@ func (p *ReverseProxy) clusterInvoke(srv *BfeServer, cluster *bfe_cluster.BfeClu
 				backend.OnFail(cluster.Name)
 			}
 
-		case bfe_http.ReadRespHeaderError:
+		case bfe_http.ReadRespHeaderError, bfe_fcgi.ReadRespHeaderError:
 			request.ErrCode = bfe_basic.ErrBkReadRespHeader
 			request.ErrMsg = err.Error()
 			p.proxyState.ErrBkReadRespHeader.Inc(1)
@@ -386,7 +450,32 @@ func (p *ReverseProxy) sendResponse(rw bfe_http.ResponseWriter, res *bfe_http.Re
 	// note: writeheader don't guarantee send header
 	rw.WriteHeader(res.StatusCode)
 
-	return p.copyResponse(rw, res.Body, flushInterval, cancelOnClientClose)
+	err := p.copyResponse(rw, res.Body, flushInterval, cancelOnClientClose)
+	res.Body.Close() // close now, instead of defer, to populate res.Trailer
+	if err != nil {
+		return err
+	}
+
+	if res.H2Trailer == nil {
+		return nil
+	}
+
+	if len(*res.H2Trailer) > 0 {
+		// Force chunking if we saw a response trailer.
+		// This prevents net/http from calculating the length for short
+		// bodies and adding a Content-Length.
+		if fl, ok := rw.(bfe_http.Flusher); ok {
+			fl.Flush()
+		}
+	}
+
+	for k, vv := range *res.H2Trailer {
+		k = TrailerPrefix + k
+		for _, v := range vv {
+			rw.Header().Add(k, v)
+		}
+	}
+	return nil
 }
 
 // prepareSigner prepare SignCalculater for response.
@@ -491,6 +580,9 @@ func (p *ReverseProxy) ServeHTTP(rw bfe_http.ResponseWriter, basicReq *bfe_basic
 	isRedirect := false
 	resFlushInterval := time.Duration(0)
 	cancelOnClientClose := false
+
+	timeoutWriteClient := time.Duration(cluster_conf.DefaultWriteClientTimeout) * time.Millisecond
+	timeoutReadClientAgain := time.Duration(cluster_conf.DefaultReadClientAgainTimeout) * time.Millisecond
 
 	// get instance of BfeServer
 	srv := p.server
@@ -597,6 +689,10 @@ func (p *ReverseProxy) ServeHTTP(rw bfe_http.ResponseWriter, basicReq *bfe_basic
 
 	// set deadline to finish read client request body
 	p.setTimeout(bfe_basic.StageReadReqBody, basicReq.Connection, req, cluster.TimeoutReadClient())
+	resFlushInterval = cluster.ResFlushInterval()
+	cancelOnClientClose = cluster.CancelOnClientClose()
+	timeoutWriteClient = cluster.TimeoutWriteClient()
+	timeoutReadClientAgain = cluster.TimeoutReadClientAgain()
 
 	// Callback for HandleAfterLocation
 	hl = srv.CallBacks.GetHandlerList(bfe_module.HandleAfterLocation)
@@ -649,33 +745,39 @@ func (p *ReverseProxy) ServeHTTP(rw bfe_http.ResponseWriter, basicReq *bfe_basic
 	// to objects which are not used any more.
 	basicReq.SvrDataConf = nil
 
-	if err != nil {
+	if err != nil || res == nil {
 		basicReq.Stat.ResponseStart = time.Now()
 		basicReq.BfeStatusCode = bfe_http.StatusInternalServerError
 		res = bfe_basic.CreateInternalSrvErrResp(basicReq)
 		goto response_got
 	}
-	resFlushInterval = cluster.ResFlushInterval()
-	cancelOnClientClose = cluster.CancelOnClientClose()
 	if resFlushInterval == 0 && basicReq.HttpRequest.Header.Get("Accept") == "text/event-stream" {
 		resFlushInterval = cluster.DefaultSSEFlushInterval()
 	}
 
+response_got:
 	// timeout for write response to client
 	// Note: we use io.Copy() to read from backend and write to client.
 	// For avoid from blocking on client conn or backend conn forever,
 	// we must timeout both conns after specified duration.
-	p.setTimeout(bfe_basic.StageWriteClient, basicReq.Connection, req, cluster.TimeoutWriteClient())
-	writeTimer = time.AfterFunc(cluster.TimeoutWriteClient(), func() {
-		transport := basicReq.Trans.Transport.(*bfe_http.Transport)
-		transport.CancelRequest(basicReq.OutRequest) // force close connection to backend
+	p.setTimeout(bfe_basic.StageWriteClient, basicReq.Connection, req, timeoutWriteClient)
+	writeTimer = time.AfterFunc(timeoutWriteClient, func() {
+		if basicReq.Trans.Transport != nil {
+			// TODO: process bfe_fcgi.Transport & bfe_http2.Transport
+			switch t := basicReq.Trans.Transport.(type) {
+			case *bfe_http.Transport:
+				t.CancelRequest(req)
+			default:
+				// do nothing
+			}
+		}
+
 	})
 	defer writeTimer.Stop()
 
 	// for read next request
-	defer p.setTimeout(bfe_basic.StageEndRequest, basicReq.Connection, req, cluster.TimeoutReadClientAgain())
+	defer p.setTimeout(bfe_basic.StageEndRequest, basicReq.Connection, req, timeoutReadClientAgain)
 
-response_got:
 	defer res.Body.Close()
 
 	// Callback for HandleReadResponse
@@ -784,6 +886,29 @@ func checkRequestWithoutBody(req *bfe_http.Request) bool {
 	}
 	if body, ok := req.Body.(*bfe_spdy.RequestBody); ok {
 		return body.Eof()
+	}
+	return false
+}
+
+func checkBackendStatus(outlierDetectionHttpCodeStr string, statusCode int) bool {
+	if outlierDetectionHttpCodeStr == "" {
+		return false
+	}
+	for _, code := range strings.Split(outlierDetectionHttpCodeStr, "|") {
+		switch code {
+		case "3xx", "4xx", "5xx":
+			if strconv.Itoa(statusCode/100) == code[0:1] {
+				return true
+			}
+		default:
+			codeInt, err := strconv.Atoi(code)
+			if err != nil {
+				continue
+			}
+			if codeInt == statusCode {
+				return true
+			}
+		}
 	}
 	return false
 }

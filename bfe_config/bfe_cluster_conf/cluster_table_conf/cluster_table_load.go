@@ -27,7 +27,7 @@ import (
 )
 
 import (
-	jsoniter "github.com/json-iterator/go"
+	"github.com/bfenetworks/bfe/bfe_util/json"
 )
 
 // BackendConf is conf of backend
@@ -162,9 +162,9 @@ func (conf *AllClusterBackend) Check() error {
 	return AllClusterBackendCheck(conf)
 }
 
-func (sub *SubClusterBackend) Check() error {
+func (s *SubClusterBackend) Check() error {
 	availBackend := false
-	for index, backendConf := range *sub {
+	for index, backendConf := range *s {
 		err := BackendConfCheck(backendConf)
 
 		if err != nil {
@@ -225,7 +225,6 @@ func ClusterTableLoad(filename string) (ClusterTableConf, error) {
 	}
 
 	/* decode the file  */
-	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	decoder := json.NewDecoder(file)
 
 	err2 := decoder.Decode(&config)
@@ -247,7 +246,6 @@ func ClusterTableLoad(filename string) (ClusterTableConf, error) {
 // ClusterTableDump dumps conf to file
 func ClusterTableDump(conf ClusterTableConf, filename string) error {
 	// marshal to json
-	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	confJson, err := json.Marshal(conf)
 	if err != nil {
 		return err

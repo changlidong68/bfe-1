@@ -15,7 +15,6 @@
 package mod_header
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -24,6 +23,7 @@ import (
 
 import (
 	"github.com/bfenetworks/bfe/bfe_basic/condition"
+	"github.com/bfenetworks/bfe/bfe_util/json"
 )
 
 type HeaderRuleFile struct {
@@ -65,7 +65,7 @@ func HeaderRuleCheck(conf HeaderRuleFile) error {
 	}
 
 	// check Actions
-	if conf.Actions == nil {
+	if conf.Actions == nil || len(*conf.Actions) == 0 {
 		return errors.New("no Actions")
 	}
 

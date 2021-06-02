@@ -113,6 +113,13 @@ func (cluster *BfeCluster) RetryLevel() int {
 	return *retryLevel
 }
 
+func (cluster *BfeCluster) OutlierDetectionHttpCode() string {
+	cluster.RLock()
+	outlierDetectionHttpCode := cluster.backendConf.OutlierDetectionHttpCode
+	cluster.RUnlock()
+	return *outlierDetectionHttpCode
+}
+
 func (cluster *BfeCluster) TimeoutReadClient() time.Duration {
 	cluster.RLock()
 	res := cluster.timeoutReadClient

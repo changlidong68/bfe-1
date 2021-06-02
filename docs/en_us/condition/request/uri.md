@@ -35,6 +35,22 @@ req_host_in("www.bfe-networks.com | bfe-networks.com")
 req_path_in("/api/search|/api/list", true)
 ```
 
+## req_path_contain(path_list, case_insensitive)
+* Description: Judge if request path contains configured patterns
+
+* Parameters
+
+| Parameter | Descrption |
+| --------- | ---------- |
+| path_list | String<br>path's substring list which are concatenated with &#124; |
+| case_insensitive | Boolean<br>case insensitive |
+
+* Example
+
+```go
+req_path_contain("search|analytics", true)
+```
+
 ## req_path_prefix_in(prefix_list, case_insensitive)
 * Description: Judge if request path prefix matches configured patterns
 
@@ -67,6 +83,21 @@ req_path_prefix_in("/api/report|/api/analytics", false)
 req_path_suffix_in(".php|.jsp", false)
 ```
 
+## req_path_element_prefix_in(prefix_list, case_insensitive)
+* Description: Judge if request path element prefix matches configured patterns
+
+* Parameters
+
+| Parameter | Descrption |
+| --------- | ---------- |
+| prefix_list | String<br>a list of path element prefixs which are concatenated using &#124; <br>Each path prefix should start with '/' and end with '/', Automatic add '/' suffix when not end with '/'  |
+| case_insensitive | Boolean<br>case insensitive |
+
+* Example
+
+```go
+req_path_element_prefix_in("/api/report/|/api/analytics/", false)
+```
 ## req_query_key_in(key_list)
 * Description: Judge if query key matches configured patterns
 
